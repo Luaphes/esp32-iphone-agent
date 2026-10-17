@@ -223,6 +223,7 @@ $("cal").addEventListener("click", async () => {
   const r = await post("/api/calibrate/start");
   if (!r) return calibrationHint(null);
   if (r.auto) return calibrationHint("calOk");  // found the pointer by itself
+  if (r.manual === false) return;  // automatic multi-point calibration reports its state through /status
   calibrating = true;
   calibrationHint("calNow");
 });
@@ -258,6 +259,22 @@ async function poll() {
     $("live-dot").classList.toggle("on", a.running);
 
     aspect = s.aspect || aspect;
+    if (s.baseline && !calibrating) {
+      const b = s.baseline, zh = lang === "zh";
+      const family = b.source?.family || (zh ? "设备" : "Device");
+      const direction = b.geometry && (b.geometry[0] < b.geometry[1] ? (zh ? "竖屏" : "portrait") : (zh ? "横屏" : "landscape"));
+      const messages = {
+        calibrating: zh ? "正在建立设备控制基准，请保持解锁和方向不变…" : "Measuring the device baseline; keep it unlocked and still…",
+        ready: `${family}${direction ? ` · ${direction}` : ""} · ${zh ? "控制基准已验证" : "baseline verified"}`,
+        failed: zh ? "基准未通过验证，请点击校准重试" : "Baseline verification failed; retry Calibrate",
+        cancelled: zh ? "基准测量已停止，点击校准可重试" : "Baseline measurement stopped; retry Calibrate",
+        stale: zh ? "设备或方向已变化，等待重新建立基准" : "Device or orientation changed; waiting for calibration",
+      };
+      if (messages[b.phase]) {
+        $("caption").textContent = messages[b.phase];
+        $("caption").classList.toggle("callout", b.phase !== "ready");
+      }
+    }
     const avg = (xs) => (xs.length ? fmt(xs.reduce((n, x) => n + x, 0) / xs.length) : "–");
     const planned = steps.filter((x) => isPlan(x) && x.think_s != null).map((x) => x.think_s);
     const acted = steps.filter((x) => !isPlan(x) && x.think_s != null).map((x) => x.think_s);

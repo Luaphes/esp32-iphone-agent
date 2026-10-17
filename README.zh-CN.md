@@ -17,6 +17,8 @@
 
 本地维护：[通用设备控制能力：判断、修复与验收标准](docs/general-control-standard.zh-CN.md)。后续修复按此标准区分现有能力、诊断实验与实际验收结果。
 
+当前实验：[连接设备后建立实测控制基准](docs/device-baseline.zh-CN.md)。启动入口为 `bash scripts/run-device-baseline.sh`；上游基线和此前修改版继续保留。
+
 原始项目资料：[手机智能控制器产品提案](docs/手机智能控制器产品提案.md) · [Android 控制方案初步调研](docs/Android控制方案初步调研.md) · [iOS 控制验证记录](docs/iOS控制验证记录.md)。原文按当时日期保留，历史验证状态不代替最新验收。
 
 <p align="center"><img src="docs/images/demo.png" alt="示例 1：在白板里画完笑脸后的网页界面，包括实时画面、实时日志、计划和每一步的截图" width="100%"></p>

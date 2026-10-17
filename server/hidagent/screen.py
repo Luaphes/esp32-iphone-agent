@@ -1,8 +1,10 @@
 """The phone's screen, received over AirPlay mirroring by UxPlay, as JPEG frames."""
 
 import asyncio
+import hashlib
 import logging
 import os
+import re
 import subprocess
 import threading
 import time
@@ -20,6 +22,7 @@ class Screen:
         self._proc = None
         self._clients_at, self._clients_n = 0.0, None
         self._stopping = False
+        self.source_epoch, self.source_key, self.source = 0, None, {}
 
     def start(self) -> None:
         threading.Thread(target=self._supervise, daemon=True).start()
@@ -28,6 +31,26 @@ class Screen:
         self._stopping = True
         if self._proc:
             self._proc.terminate()
+            try:
+                self._proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+                self._proc.wait(timeout=2)
+
+    def _source_line(self, line):
+        match = re.search(r"connection request from .+ \(([^)]+)\) with deviceID = (\S+)", line)
+        if match:
+            model, identity = match.groups()
+            self.source_key = hashlib.sha256(identity.encode()).hexdigest()[:16]
+            self.source_epoch += 1
+            family = "iPad" if model.startswith("iPad") else "iPhone" if model.startswith("iPhone") else "Apple device"
+            self.source = {"model": model, "family": family, "key": self.source_key}
+
+    def _logs(self, process):
+        for raw in process.stdout:
+            line = raw.decode(errors="replace").strip()
+            self._source_line(line)
+            log.info("uxplay: %s", re.sub(r"deviceID = \S+", "deviceID = <redacted>", line))
 
     def _supervise(self) -> None:
         """Keep UxPlay running: it exits on some disconnects, so restart it every time."""
@@ -37,7 +60,8 @@ class Screen:
                     f"jpegenc quality={self.quality} ! fdsink fd={write_fd}")
             self._proc = subprocess.Popen(
                 ["uxplay", "-n", self.name, "-nh", "-a", "-reset", "0", "-vs", sink],
-                pass_fds=(write_fd,))  # UxPlay logs to stdout: keep them in ours
+                pass_fds=(write_fd,), stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            threading.Thread(target=self._logs, args=(self._proc,), daemon=True).start()
             os.close(write_fd)
             log.info("AirPlay receiver '%s' started (pid %d)", self.name, self._proc.pid)
             self._read(read_fd)  # returns when UxPlay closes the pipe
@@ -82,13 +106,18 @@ class Screen:
         return n
 
     @property
-    def aspect(self) -> float:
-        """Frame width / height, read from the JPEG header (portrait iPhone as a fallback)."""
+    def geometry(self) -> tuple[int, int] | None:
+        """The mirrored frame size; no device model or portrait assumption."""
         f = self.frame or b""
         i = f.find(b"\xff\xc0")  # baseline start-of-frame: ... height(2) width(2)
         if i < 0 or len(f) < i + 9:
-            return 9 / 19.5
-        return int.from_bytes(f[i + 7:i + 9], "big") / int.from_bytes(f[i + 5:i + 7], "big")
+            return None
+        return int.from_bytes(f[i + 7:i + 9], "big"), int.from_bytes(f[i + 5:i + 7], "big")
+
+    @property
+    def aspect(self) -> float:
+        size = self.geometry
+        return size[0] / size[1] if size else 9 / 19.5
 
     async def settled(self, quiet: float = 0.35, least: float = 0.25, most: float = 4) -> None:
         """Wait until the screen stops changing (AirPlay only sends frames on change)."""

@@ -14,7 +14,8 @@ from collections import deque
 from pathlib import Path
 
 from . import vision
-from .device import Device
+from .calibration import Axis, Calibration
+from .device import Device, DeviceError
 
 log = logging.getLogger(__name__)
 
@@ -37,6 +38,14 @@ class Phone:
         self._pos = None  # pointer position in mouse units; None = unknown
         self._moves = 0
         self._link = 0  # device.links when the pointer was last homed
+        self._baseline = (saved or {}).get("baseline")
+        self._bound = None  # a saved fit is a seed, not proof about this connection
+        self._calibration_job = None
+        self._cancel_requested = False
+        self._paused_view = None
+        self._dragging = False
+        self._home_link, self._home_supported = None, None
+        self.baseline_phase, self.baseline_error, self.baseline_progress = "waiting", "", ""
         # where the pointer really landed (seen on screen) for the screen fraction we aimed at, per axis;
         # a straight-line fit through them corrects every later move, so taps get better as the agent works
         self._seen = {axis: deque(map(tuple, (saved or {}).get("seen", {}).get(axis, [])), maxlen=12)
@@ -44,41 +53,80 @@ class Phone:
 
     @property
     def calibrated(self) -> bool:
-        return self.span is not None
+        if self.screen is None:
+            return self.span is not None
+        return bool(self._baseline and self.screen.live and self._bound == self.signature())
+
+    def signature(self):
+        if self.screen is None:
+            return (self.device.links, None, None, None)
+        return (self.device.links, getattr(self.screen, "source_epoch", 0), self.screen.geometry,
+                getattr(self.screen, "source_key", None))
+
+    def baseline_status(self):
+        phase = self.baseline_phase
+        if phase == "ready" and not self.calibrated:
+            phase = "stale"
+        return {"phase": phase, "progress": self.baseline_progress, "error": self.baseline_error,
+                "geometry": self.screen.geometry if self.screen else None,
+                "source": getattr(self.screen, "source", {}),
+                "checks": (self._baseline or {}).get("checks", []) if self.calibrated else []}
+
+    def cancel_calibration(self):
+        self._cancel_requested = True
+        self._paused_view = self.signature()[1:]
+        if self._calibration_job:
+            self._calibration_job.cancel()
+
+    @property
+    def calibration_paused(self):
+        return self._paused_view == self.signature()[1:]
 
     async def start_calibration(self) -> bool:
-        """Find the pointer on screen at two known distances from the corner and fit the mapping from both.
-
-        Two points give the scale and the offset, which one point cannot (iOS pointer motion is not exactly
-        proportional). Returns True when it calibrated itself; otherwise the user clicks the pointer
-        (finish_calibration).
-        """
-        self._pos = None
-        await self.device.send("home")
-        seen = []
-        for units in CALIBRATION_STOPS:
-            step = units - (seen[-1][0] if seen else 0)
-            await self.device.send(f"move {step} {step}")
-            found = await self._find_pointer() if self.screen is not None and self.screen.live else None
-            if not found:
-                break
-            seen.append((units, *found))
-        if len(seen) < 2:
-            log.info("calibration: pointer not found on screen, waiting for a click")
-            if not seen:
-                await self.device.send("home")
-                await self.device.send(f"move {CALIBRATION_MOVE} {CALIBRATION_MOVE}")
+        """Fit multiple observed positions and verify held-out points, including the bottom edge."""
+        self._bound, self._pos = None, None
+        self.baseline_phase, self.baseline_error = "calibrating", ""
+        self._cancel_requested = False
+        self._paused_view = None
+        signature = self.signature()
+        if self.screen is None or not self.screen.live or not self.screen.geometry:
+            self.baseline_phase, self.baseline_error = "failed", "no live screen"
             return False
-        (u1, x1, y1), (u2, x2, y2) = seen
-        self.span = {"w": round((u2 - u1) / (x2 - x1)), "h": round((u2 - u1) / (y2 - y1))}
-        for samples in self._seen.values():
-            samples.clear()
-        for units, x, y in seen:  # where each stop landed, so moves are corrected for the offset too
-            self._seen["x"].append((units / self.span["w"], x))
-            self._seen["y"].append((units / self.span["h"], y))
-        self._save()
-        log.info("calibration: pointer at %s, span %s", [(round(x, 3), round(y, 3)) for _, x, y in seen], self.span)
-        return True
+        geometry = self.screen.geometry
+        same_geometry = (self._baseline or {}).get("geometry") == list(geometry)
+        seed = (self.span["w"], self.span["h"]) if self.span and same_geometry else tuple(v * 1.1 for v in geometry)
+        calibration = Calibration(self.device, self.screen, seed,
+                                  lambda stage: setattr(self, "baseline_progress", stage))
+        self._calibration_job = asyncio.create_task(calibration.run())
+        try:
+            baseline = await self._calibration_job
+            if signature != self.signature():
+                raise RuntimeError("device connection changed during calibration")
+            baseline["source"] = getattr(self.screen, "source", {})
+            self._baseline, self._bound = baseline, signature
+            self.span = {k: round(baseline["axes"][i]["span"]) for i, k in enumerate(("w", "h"))}
+            self._seen = {axis: deque(maxlen=12) for axis in ("x", "y")}
+            self._pos, self._link, self._moves = calibration.pos, self.device.links, 0
+            self.baseline_phase = "ready"
+            self._save()
+            log.info("baseline verified: geometry %s, span %s, checks %s", geometry, self.span, baseline["checks"])
+            return True
+        except asyncio.CancelledError:
+            self.baseline_phase, self._pos = "cancelled", None
+            if not self._cancel_requested:
+                raise
+            return False
+        except Exception as error:
+            self.baseline_phase, self.baseline_error, self._pos = "failed", str(error), None
+            log.warning("baseline not verified: %s", error)
+            return False
+        finally:
+            self._calibration_job = None
+            if self.device.connected:
+                try:
+                    await self.device.send("release")
+                except RuntimeError:
+                    pass
 
     async def _find_pointer(self) -> tuple[float, float] | None:
         """Wiggle the pointer and find it anywhere on screen (the span may still be unknown)."""
@@ -96,13 +144,15 @@ class Phone:
     def finish_calibration(self, x: float, y: float) -> None:
         """x, y: where the pointer ended up after start_calibration() (one point, picked by the user)."""
         self.span = {"w": round(CALIBRATION_MOVE / x), "h": round(CALIBRATION_MOVE / y)}
+        self._baseline, self._bound = None, None
         for samples in self._seen.values():
             samples.clear()
         self._save()
 
     def _save(self) -> None:
         """Calibration plus the observed landings, so the correction survives a restart."""
-        self._file.write_text(json.dumps({**self.span, "seen": {k: list(v) for k, v in self._seen.items()}}))
+        self._file.write_text(json.dumps({**self.span, "baseline": self._baseline,
+                                         "seen": {k: list(v) for k, v in self._seen.items()}}))
 
     async def point(self, x: float, y: float, aim: bool = False) -> None:
         if not self.calibrated:
@@ -131,14 +181,17 @@ class Phone:
             return
         fx, fy = found
         log.debug("aim (%.3f, %.3f): pointer at (%.3f, %.3f)", x, y, fx, fy)
-        if max(abs(fx - x), abs(fy - y)) <= MAX_MISS:  # learn from normal drift only, never from a stray reading
+        if not self._baseline and max(abs(fx - x), abs(fy - y)) <= MAX_MISS:
             self._seen["x"].append((self._fix(x, "x"), fx))
             self._seen["y"].append((self._fix(y, "y"), fy))
             self._save()
         if abs(fx - x) <= AIM_TOLERANCE and abs(fy - y) <= AIM_TOLERANCE:
             return
         dx, dy = round((x - fx) * self.span["w"]), round((y - fy) * self.span["h"])  # fix this miss right away
-        await self.device.send(f"move {dx} {dy}")
+        if dx:
+            await self.device.send(f"move {dx} 0")
+        if dy:
+            await self.device.send(f"move 0 {dy}")
         self._pos = (self._pos[0] + dx, self._pos[1] + dy)
 
     def _fix(self, t: float, axis: str) -> float:
@@ -155,23 +208,28 @@ class Phone:
         return (t - b) / a if abs(b) < 0.1 else t
 
     async def _move_to(self, tx: int, ty: int, rehome: bool = True) -> None:
+        if not self.calibrated:
+            raise RuntimeError("device baseline is stale; wait for calibration")
         if self._link != self.device.links:  # new link: a dropped gesture may have left the button down
             await self.device.send("release")
             self._pos, self._link = None, self.device.links
-        if self._pos is None or (rehome and self._moves >= REHOME_EVERY):
+        if self._pos is None or (rehome and not self._baseline and self._moves >= REHOME_EVERY):
             await self.device.send("home")
             self._pos, self._moves = (0, 0), 0
         x, y = self._pos
         self._pos = None  # unknown until the move succeeds
-        await self.device.send(f"move {tx - x} {ty - y}")
+        if self._dragging:
+            await self.device.send(f"move {tx - x} {ty - y}")
+        else:
+            if tx != x:
+                await self.device.send(f"move {tx - x} 0")
+            if ty != y:
+                await self.device.send(f"move 0 {ty - y}")
         self._pos, self._moves = (tx, ty), self._moves + 1
 
     async def reset(self) -> None:
         """Let go of the button and re-home the pointer, whatever state a gesture left."""
-        self._pos = None
         await self.device.send("release")
-        await self.device.send("home")
-        self._pos, self._moves = (0, 0), 0
 
     async def tap(self, x: float, y: float, aim: bool = False) -> None:
         """aim=True finds the pointer on screen first (slower); worth it when a tap just missed."""
@@ -190,12 +248,14 @@ class Phone:
         """
         await self.point(*points[0])
         await self.device.send("press")
+        self._dragging = True
         try:
             for x, y in points[1:]:
                 await self._move_to(self._dx(x), self._dy(y), rehome=False)  # never home mid-drag
             if hold:
                 await asyncio.sleep(HOLD)
         finally:
+            self._dragging = False
             await self.device.send("release")
 
     async def scroll(self, x: float, y: float, lines: int) -> None:
@@ -209,13 +269,38 @@ class Phone:
         await self.device.send(f"key {combo}")
 
     async def go_home(self) -> None:
-        await self.swipe(0.5, 0.995, 0.5, 0.6, hold=False)  # resting here would open the app switcher
+        if self._home_link != self.device.links:
+            self._home_link, self._home_supported = self.device.links, None
+        if self._home_supported is not False:
+            try:
+                await self.device.send("homescreen")
+                self._home_supported = True
+                return
+            except DeviceError as error:
+                if str(error).strip().lower() != "err unknown command":
+                    raise
+                self._home_supported = False
+        await self.point(0.5, 0.98)
+        # Establish the physical bottom boundary before pressing, even if the fit drifts slightly.
+        await self.device.send(f"move 0 {max(60, round(self.span['h'] * 0.2))}")
+        self._pos = (self._dx(0.5), self._dy(1.0))
+        await self.device.send("press")
+        self._dragging = True
+        try:
+            await self._move_to(self._dx(0.5), self._dy(0.6), rehome=False)
+        finally:
+            self._dragging = False
+            await self.device.send("release")
 
     async def go_back(self) -> None:
         await self.swipe(0.005, 0.45, 0.6, 0.45, hold=False)
 
     def _dx(self, x: float) -> int:
+        if self._baseline:
+            return Axis(**self._baseline["axes"][0]).units(x)
         return round(min(max(self._fix(x, "x"), 0), 1) * self.span["w"])
 
     def _dy(self, y: float) -> int:
+        if self._baseline:
+            return Axis(**self._baseline["axes"][1]).units(y)
         return round(min(max(self._fix(y, "y"), 0), 1) * self.span["h"])

@@ -36,21 +36,26 @@ def changed(before: bytes | None, after: bytes | None, ignore: tuple = (), thres
 
 
 def pointer(before: bytes, after: bytes, near: tuple[float, float], shift: float,
-            reach: tuple[float, float] = (0.12, 0.08)) -> tuple[float, float] | None:
+            reach: tuple[float, float] = (0.12, 0.08), color: bool = False) -> tuple[float, float] | None:
     """Where the pointer is in `before`, given it moved right by `shift` (fraction of width) in `after`.
 
     Only the pointer moved between the two frames, so the changed pixels within `reach` of `near` are the
     pointer at both spots; their centroid sits shift/2 to the right of the first one. None if unclear:
     nothing moved, or the change is too big or too spread out to be one small pointer.
     """
-    a, b = _gray(before), _gray(after)
+    a, b = ((Image.open(io.BytesIO(f)).convert("RGB") for f in (before, after))
+            if color else (_gray(before), _gray(after)))
     if a.size != b.size:
         return None
     w, h = a.size
     rx, ry = reach
     left, top = max(0, int((near[0] - rx) * w)), max(int(0.05 * h), int((near[1] - ry) * h))  # skip the status bar
     box = (left, top, min(w, int((near[0] + rx) * w)), min(h, int((near[1] + ry) * h)))
-    diff = ImageChops.difference(a.crop(box), b.crop(box)).tobytes()
+    region = ImageChops.difference(a.crop(box), b.crop(box))
+    if color:
+        red, green, blue = region.split()
+        region = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+    diff = region.tobytes()
     bw = box[2] - box[0]
     hits = [(i % bw, i // bw) for i, v in enumerate(diff) if v > 30]
     if not 15 <= len(hits) <= len(diff) // 4:  # nothing moved, or much more than a pointer

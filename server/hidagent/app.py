@@ -28,13 +28,33 @@ agent = Agent(phone, screen, LLM.from_env("ACTOR"), LLM.from_env("PLANNER"),
               Trace(DATA_DIR / "traces" if DEBUG else None))
 
 
+async def watch_baseline():
+    attempted = None
+    while True:
+        await asyncio.sleep(1)
+        if not device.connected or not screen.live or phone.calibrated:
+            continue
+        signature = phone.signature()
+        if agent.running:
+            agent.stop()  # do not let a changed device/orientation receive the old coordinates
+            continue
+        if signature == attempted or manual_lock.locked() or phone.calibration_paused:
+            continue
+        attempted = signature
+        async with manual_lock:
+            await phone.start_calibration()
+
+
 @asynccontextmanager
 async def lifespan(_):
     server = await device.serve("0.0.0.0", int(os.environ.get("DEVICE_PORT", 7300)))
     screen.start()
     awake = asyncio.create_task(device.keep_awake(screen=screen))
+    baseline = asyncio.create_task(watch_baseline())
     yield
     awake.cancel()
+    baseline.cancel()
+    await asyncio.gather(awake, baseline, return_exceptions=True)
     screen.stop()
     server.close()
 
@@ -107,6 +127,7 @@ def index():
 @app.get("/api/status")
 def status():
     return {"device": device.connected, "screen": screen.live, "calibrated": phone.calibrated,
+            "baseline": getattr(phone, "baseline_status", lambda: {})(),
             "debug": DEBUG, "trace": str(agent.trace.dir or ""), "aspect": round(screen.aspect, 4),
             "models": {"planner": agent.planner.model, "actor": agent.actor.model},
             "agent": {"running": agent.running, "task": agent.task, "steps": agent.steps}}
@@ -177,7 +198,7 @@ async def calibrate_start():
     check_manual()
     try:
         async with manual_lock:
-            return {"ok": True, "auto": await phone.start_calibration(), "span": phone.span}
+            return {"ok": True, "auto": await phone.start_calibration(), "span": phone.span, "manual": False}
     except (DeviceError, RuntimeError) as e:
         raise HTTPException(409, str(e)) from e
 
@@ -187,7 +208,10 @@ async def calibrate_finish(p: Point):
     check_manual()
     if not 0 < p.x < 1 or not 0 < p.y < 1:
         raise HTTPException(422, "calibration pointer must be inside the screen")
-    phone.finish_calibration(p.x, p.y)
+    async with manual_lock:
+        phone.finish_calibration(p.x, p.y)
+        if not await phone.start_calibration():
+            raise HTTPException(409, "device baseline could not be verified; retry calibration")
     return {"ok": True, "span": phone.span}
 
 
@@ -195,6 +219,8 @@ async def calibrate_finish(p: Point):
 async def agent_start(t: Text):
     if manual_lock.locked():
         raise HTTPException(409, "phone is busy; wait for the current action")
+    if not phone.calibrated:
+        raise HTTPException(409, "device baseline is not ready; keep screen mirroring on and calibrate")
     try:
         agent.start(t.text)
     except RuntimeError as e:
@@ -206,6 +232,8 @@ async def agent_start(t: Text):
 async def agent_stop():
     """Emergency stop: cancel the agent and release the mouse button."""
     agent.stop()
+    if getattr(phone, "baseline_phase", None) == "calibrating":
+        phone.cancel_calibration()
     await asyncio.sleep(0.1)  # let a gesture in flight finish its own release
     # Emergency stop must stay available even while a direct action holds the lock.
     try:
