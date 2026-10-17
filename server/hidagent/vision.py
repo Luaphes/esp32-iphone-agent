@@ -2,7 +2,7 @@
 
 import io
 
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw
 
 
 def _gray(jpeg: bytes) -> Image.Image:
@@ -33,6 +33,29 @@ def changed(before: bytes | None, after: bytes | None, ignore: tuple = (), thres
             if y > 0.06 * h and all((x - mx) ** 2 + (y - my) ** 2 > (0.05 * w) ** 2 for mx, my in masks):
                 hits += 1
     return hits >= 6
+
+
+def scene_changed(before: bytes | None, after: bytes | None, ignore: tuple = ()) -> bool:
+    """A substantial change, allowing sparse remote animation (use changed() for task progress).
+
+    A clock hand elsewhere must not make a tap look stale. A new screen, popup or scroll changes either
+    substantial brightness or more than .2% of unmasked pixels.
+    """
+    if not before or not after:
+        return True
+    a, b = _gray(before), _gray(after)
+    if a.size != b.size:
+        return True
+    diff = ImageChops.difference(a, b)
+    draw = ImageDraw.Draw(diff)
+    w, h = a.size
+    draw.rectangle((0, 0, w, int(.06*h)), fill=0)
+    radius = .05 * w
+    for x, y in ignore:
+        cx, cy = x * w, y * h
+        draw.ellipse((cx-radius, cy-radius, cx+radius, cy+radius), fill=0)
+    small = diff.resize((32, 64), Image.BILINEAR).tobytes()
+    return sum(small) / len(small) > 1 or sum(diff.histogram()[31:]) > .002 * w * h
 
 
 def pointer(before: bytes, after: bytes, near: tuple[float, float], shift: float,

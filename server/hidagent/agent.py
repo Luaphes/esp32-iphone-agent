@@ -10,32 +10,39 @@ import time
 from . import vision
 from .debug import Trace
 from .device import DeviceError
+from .grounding import locate_tap
 from .llm import LLM
 from .phone import Phone
 from .screen import Screen
 
 log = logging.getLogger(__name__)
 
-PLANNER_PROMPT = """You plan tasks on an iPhone. Given the goal and the current screen,
+PLANNER_PROMPT = """You plan tasks on an iPhone or iPad. Given the goal and the current screen,
 write a short numbered plan (at most 6 steps) of what to do on screen. Plain text only, in English.
 Plan only what the goal needs, from what you can see; never invent accounts, emails, logins or
 screens you have not seen. Later steps can stay general (e.g. "Draw the face on the canvas").
 To open an app, prefer search over paging through home screens: tap the "Search" pill above
 the dock (or swipe down from the middle of the home screen), type the app name, tap the result."""
 
-ACTOR_PROMPT = """You operate an iPhone through a mouse pointer. You see the current screen.
+ACTOR_PROMPT = """You operate an iPhone or iPad through a mouse pointer. You see the current screen.
 Reply in this format, nothing else:
 THINK: <plain English a non-technical user understands: first check your last action against the
        screen (did it do what you intended?), then what you do now and why>
 DO: <action>
 
-Give several DO lines (up to 6, run in order) whenever the next actions do not depend on seeing the
-result: e.g. ticking several visible checkboxes or days, several drawing strokes, typing then pressing enter.
-Give ONE DO line when the next action depends on what this one opens or changes.
+Give exactly ONE DO line. After every action you will see a new screenshot before acting again.
+Never combine a tap that opens a menu or changes the toolbar with drawing, typing or done: you must
+look at the new screen first.
+An independent checker reviews each action against the screen. When it reports a mismatch, correct
+the visible result before continuing. After three mismatches the task restarts from the home screen.
 
 Coordinates are integers 0-1000 relative to the screenshot (x left->right, y top->bottom).
 Aim at the visual center of the element you want, not its edge or its label.
 Look before you act: describe what is really on the screen now, not what you expect.
+Do not assume where a toolbar button is because it was there on another device or app; read the
+current screen. After opening a menu, look at what it contains instead of repeating the same tap.
+Before path or circle, the drawing tool must be visibly selected and no menu may be open. If a menu
+opened or a shape got selected instead, close it and choose the actual tool again.
 Each recent action says whether the screen changed after it. If it did NOT change, the action
 missed or had no effect: do not assume it worked; aim again more precisely or try another way.
 Only type when a text field is visibly focused (the keyboard is showing).
@@ -59,14 +66,36 @@ Actions:
   key COMBO                 (enter, backspace, esc, cmd+a, ...)
   home | back | wait
   replan                    (the plan no longer fits the screen)
-  done ANSWER               (the goal is reached; ANSWER is the result for the user)
+  done ANSWER               (the goal is reached; completion is independently verified from the screen)
   fail REASON
 
 Example:
 THINK: My last tap opened the home screen as intended. The App Store icon is visible, so I tap it.
 DO: tap 152 362"""
 
-META = ("t", "thought", "thought_zh", "think_s", "act_s", "shot", "_shot", "changed")  # not part of the action
+VERIFY_PROMPT = """Independently verify whether the original phone task is complete using only the current screenshot.
+Do not trust the executor's claim, the plan, or earlier taps as evidence.
+For text or drawings, check that the actual content is visible. For settings, check the visible state;
+never infer a hidden save or a state that is not shown.
+Reply exactly in this format:
+VERDICT: complete
+REASON: <one sentence citing visible evidence>
+or
+VERDICT: incomplete
+REASON: <what is still missing or wrong>"""
+
+VALIDATE_PROMPT = """You check one action in a phone task. The actor stated its intent and the action it performed.
+Look at the current screenshot and judge whether the action achieved that intended visible effect.
+Judge only what is visible; do not infer hidden effects and do not trust the actor's claim.
+Reply exactly in this format:
+VERDICT: ok
+REASON: <visible evidence that the intended effect happened>
+or
+VERDICT: mismatch
+REASON: <what is actually visible instead, and why it does not match>"""
+
+META = ("t", "thought", "thought_zh", "think_s", "act_s", "shot", "_shot", "changed", "validated",
+        "validation", "validate_s", "verified", "verification", "verify_s", "ground_s", "proposed")  # not the action
 
 # action name -> argument names; numeric arguments are 0-1000 screen coordinates
 ACTIONS = {"tap": ("x", "y"), "swipe": ("x1", "y1", "x2", "y2"), "circle": ("x", "y", "r"), "path": ("points",),
@@ -98,14 +127,16 @@ def parse_command(line: str) -> dict:
 
 
 def parse_actions(text: str) -> list[dict]:
-    """Parse a THINK / DO… reply (an optional ZH line is kept); the thought goes on the first action."""
+    """Parse a THINK / DO… reply (an optional ZH line is kept); the thought goes on the action."""
     thought = re.search(r"^\s*THINK\s*[:：]\s*(.*?)\s*$", text, re.M | re.I)
     zh = re.search(r"^\s*ZH\s*[:：]\s*(.*?)\s*$", text, re.M | re.I)
-    acts = [parse_command(line) for line in re.findall(r"^\s*DO\s*[:：]\s*(.*?)\s*$", text, re.M | re.I)][:6]
-    if not acts:
+    lines = re.findall(r"^\s*DO\s*[:：]\s*(.*?)\s*$", text, re.M | re.I)
+    if not lines:
         raise ValueError(f"no DO line in reply: {text[:200]}")
-    acts[0] = {"thought": thought.group(1) if thought else "", "thought_zh": zh.group(1) if zh else "", **acts[0]}
-    return acts
+    if len(lines) > 1:
+        raise ValueError(f"exactly one DO action is required, got {len(lines)}; act once and inspect the result")
+    act = parse_command(lines[0])
+    return [{"thought": thought.group(1) if thought else "", "thought_zh": zh.group(1) if zh else "", **act}]
 
 
 def parse_plan(text: str) -> tuple[str, str]:
@@ -125,14 +156,17 @@ class BlindError(RuntimeError):
 
 class Agent:
     def __init__(self, phone: Phone, screen: Screen, actor: LLM, planner: LLM, trace: Trace,
-                 max_steps: int = 40, max_failures: int = 3):
+                 max_steps: int = 40, max_failures: int = 3, max_attempts: int = 3):
         self.phone, self.screen, self.actor, self.planner = phone, screen, actor, planner
         self.trace = trace
-        self.max_steps, self.max_failures = max_steps, max_failures
+        self.max_steps, self.max_failures, self.max_attempts = max_steps, max_failures, max_attempts
         self.task, self.plan, self.steps = "", "", []
         self.shots: dict[int, bytes] = {}  # step index -> screenshot the model decided on
         self._pointer = (0.0, 0.0)  # last pointer position (screen fractions)
         self._job: asyncio.Task | None = None
+        self._attempts, self._mismatches = 1, 0
+        self._history_start = 0  # steps before this belong to an abandoned attempt
+        self._last_validation = ""
 
     @property
     def running(self) -> bool:
@@ -145,6 +179,8 @@ class Agent:
             raise RuntimeError("no phone screen: start Screen Mirroring first")
         self.task, self.plan, self.steps, self.shots = task, "", [], {}
         self._pointer = (0.0, 0.0)
+        self._attempts, self._mismatches = 1, 0
+        self._history_start, self._last_validation = 0, ""
         self.trace.start(task)
         self._job = asyncio.create_task(self._run())
 
@@ -202,36 +238,113 @@ class Agent:
             self._record(action="error", reason=repr(e))
 
     async def _step(self) -> bool:
-        """One see-think-act round (one or more actions). Returns True when the task is over."""
-        acts = await self._next_actions()
-        seen = acts[0]["_shot"]
-        spots = [self._pointer]  # where the pointer was and goes: pointer moves are not screen changes
-        stuck = self._repeating(acts[0])
-        for i, act in enumerate(acts):
-            name = act["action"]
-            if name == "replan" or stuck:
-                self._record(act.pop("_shot"), **act)
-                await self._replan(stuck=stuck)
-                return False
-            if name not in ("done", "fail"):
-                started = time.time()
-                await self._do(act)
-                act["act_s"] = round(time.time() - started, 2)
-                spots += _pointer_path(act)
-                self._pointer = spots[-1]
-            self._record(act.pop("_shot"), **act)
-            if name in ("done", "fail"):
+        """One see-think-act round (exactly one action). Returns True when the task is over."""
+        act = (await self._next_actions())[0]
+        shot = act.pop("_shot")
+        if act["action"] == "replan" or self._repeating(act):
+            self._record(shot, **act)
+            await self._replan(stuck=True)
+            return False
+        if act["action"] == "done":
+            await self.screen.settled(quiet=.2, least=.2, most=1.0)
+            ok, reply, seconds, _ = await self._verify(act.get("answer", ""))
+            act.update(verified=ok, verification=reply, verify_s=seconds)
+            self._record(shot, **act)
+            if ok:
                 return True
-            following = acts[i + 1]["action"] if i < len(acts) - 1 else None
-            if name == "tap" and following in ("type", "key"):  # typing into a field that a missed tap never opened
-                await self.screen.settled()
-                if not vision.changed(seen, self.screen.frame, ignore=tuple(spots)):
-                    self.steps[-1]["changed"] = False
-                    return False  # skip the rest; the actor looks again
+            self._record(action="hiccup", reason=f"completion not verified: {reply}"[:300])
+            await self._replan(stuck=True)
+            return False
+        if act["action"] == "fail":
+            self._record(shot, **act)
+            return True
+        if act["action"] == "tap":
+            act = await self._ground_tap(act, shot)
+        started = time.time()
+        await self._do(act)
+        act["act_s"] = round(time.time() - started, 2)
+        self._record(shot, **act)
         await self.screen.settled()
-        # feedback for the next round
-        self.steps[-1]["changed"] = vision.changed(seen, self.screen.frame, ignore=tuple(spots))
+        spots = [self._pointer, *_pointer_path(act)]
+        self._pointer = spots[-1]
+        changed = vision.changed(shot, self.screen.frame, ignore=tuple(spots))
+        self.steps[-1]["changed"] = changed
+        if act["action"] == "wait":
+            return False
+        if not changed:
+            ok, reason = False, "the screen did not change after the action"
+        else:
+            ok, reason, seconds, _ = await self._validate_action(act)
+            self.steps[-1]["validated"], self.steps[-1]["validation"] = ok, reason
+            self.steps[-1]["validate_s"] = seconds
+        if ok:
+            self._last_validation = ""
+            return False
+        self._mismatches += 1
+        self._last_validation = reason
+        self._record(action="hiccup", reason=f"step check: {reason}"[:300])
+        if self._mismatches >= 3:
+            return await self._restart()
         return False
+
+    async def _validate_action(self, act: dict) -> tuple[bool, str, float, bytes | None]:
+        """Independently check that the action produced the visible effect the actor intended."""
+        prompt = (f"Actor's intent: {act.get('thought', '')}\n"
+                  f"Action just performed: {json.dumps(_key(act))}\n\n"
+                  "Look at the current screen and judge the intended visible effect.")
+        reply, seconds, frame = await self._ask("step verifier", self.planner or self.actor, VALIDATE_PROMPT, prompt)
+        match = re.search(r"VERDICT\s*[:：]\s*(ok|mismatch)", reply, re.I)
+        reason = re.search(r"REASON\s*[:：]\s*(.+)", reply, re.I | re.S)
+        detail = reason.group(1).strip() if reason else reply.strip()
+        return bool(match and match.group(1).lower() == "ok"), detail, seconds, frame
+
+    async def _restart(self) -> bool:
+        """After three failed step checks, return home and run a fresh attempt (bounded)."""
+        if self._attempts >= self.max_attempts:
+            self._record(action="fail", reason=f"three step checks failed in attempt {self._attempts}; "
+                                               "no restart attempts left")
+            return True
+        self._attempts += 1
+        self._record(action="restart", reason=f"three step checks failed; restarting attempt "
+                                              f"{self._attempts}/{self.max_attempts} from the home screen")
+        self._mismatches, self._last_validation = 0, ""
+        self._pointer, self.plan = (0.0, 0.0), ""
+        try:
+            await self.phone.go_home()
+        except Exception as e:
+            self._record(action="hiccup", reason=f"restart could not reach the home screen: {e}"[:300])
+        await self._replan(stuck=True)
+        self._history_start = len(self.steps)
+        return False
+
+    async def _ground_tap(self, action: dict, frame: bytes) -> dict:
+        """Refine a tap against the screenshot the actor decided on; never click a stale screen."""
+        refined = await locate_tap(self.actor, frame, action, self.trace)
+        if not self.screen.live:
+            raise BlindError("lost the phone screen: reconnect Screen Mirroring")
+        if self.screen.frame != frame and vision.scene_changed(frame, self.screen.frame):
+            raise RuntimeError("screen changed while locating the target; discard the tap and observe again")
+        return refined
+
+    async def _verify(self, answer: str) -> tuple[bool, str, float, bytes | None]:
+        """An independent model check before accepting done; a claim alone is not evidence."""
+        prompt = (f"Original goal: {self.task}\n\nExecutor's claimed result: {answer}\n\n"
+                  f"Executed actions and observed effects:\n{self._history()}\n\n"
+                  "Look at the current screen and verify the goal.")
+        reply, seconds, frame = await self._ask("verifier", self.planner or self.actor, VERIFY_PROMPT, prompt)
+        match = re.search(r"VERDICT\s*[:：]\s*(complete|incomplete|failed)", reply, re.I)
+        reason = re.search(r"REASON\s*[:：]\s*(.+)", reply, re.I | re.S)
+        detail = reason.group(1).strip() if reason else reply.strip()
+        return bool(match and match.group(1).lower() == "complete"), detail, seconds, frame
+
+    def _history(self, limit: int = 8) -> str:
+        hidden = ("t", "plan", "plan_zh", "think_s", "act_s", "shot", "_shot", "thought", "thought_zh",
+                  "changed", "validated", "validation", "validate_s", "verified", "verification",
+                  "verify_s", "ground_s", "proposed")
+        effect = {True: " -> screen changed", False: " -> screen did NOT change"}
+        return "\n".join(json.dumps({k: v for k, v in s.items() if k not in hidden})[:300]
+                         + effect.get(s.get("changed"), "")
+                         for s in self.steps[self._history_start:][-limit:] if "plan" not in s) or "(none)"
 
     def _missed(self) -> bool:
         """The previous round changed nothing on screen, so a tap may have landed off target."""
@@ -242,7 +355,7 @@ class Agent:
 
         Repeating a move that still changes the screen (e.g. scrolling down a long list) is progress, not a loop.
         """
-        moves = [s for s in self.steps if "plan" not in s][-(limit - 1):]
+        moves = [s for s in self.steps[self._history_start:] if "plan" not in s][-(limit - 1):]
         return (len(moves) == limit - 1 and all(_key(m) == _key(act) for m in moves)
                 and moves[-1].get("changed") is not True)
 
@@ -258,19 +371,19 @@ class Agent:
                      think_s=seconds)
 
     async def _next_actions(self) -> list[dict]:
-        # actions and their effect only: echoing earlier thoughts makes the model repeat them instead of looking
-        hidden = ("t", "plan", "plan_zh", "think_s", "act_s", "shot", "thought", "thought_zh", "changed")
-        effect = {True: " -> screen changed", False: " -> screen did NOT change"}
-        history = "\n".join(json.dumps({k: v for k, v in s.items() if k not in hidden})[:300]
-                            + effect.get(s.get("changed"), "")
-                            for s in self.steps[-8:] if "plan" not in s) or "(none)"
-        prompt = f"Goal: {self.task}\n\nPlan:\n{self.plan}\n\nRecent actions:\n{history}\n\nNext action?"
+        prompt = (f"Goal: {self.task}\n\nPlan:\n{self.plan}\n\nRecent actions:\n{self._history()}"
+                  "\n\nNext action?")
+        if self._last_validation:
+            prompt += (f"\n\nIndependent check of your last action: {self._last_validation}\n"
+                       "The visible result did not match your intent; correct that before continuing.")
         for attempt in range(3):  # retry unparseable replies, a little less deterministically
             reply, seconds, frame = await self._ask("actor", self.actor, ACTOR_PROMPT, prompt, 0.4 * attempt)
             try:
                 acts = parse_actions(reply)
             except ValueError as e:
-                log.warning("unparseable actor reply (%s): %s", e, reply[:200])
+                log.warning("rejected actor reply (%s): %s", e, reply[:200])
+                prompt += (f"\n\nYour last reply was rejected: {e}. Reply with exactly ONE DO line; "
+                           "never combine tool selection with drawing, typing or done.")
                 continue
             if self._missed() and _key(acts[0]) == _key(self.steps[-1]):  # same move that just did nothing
                 log.info("actor repeated an action that changed nothing; asking for another")
@@ -278,7 +391,7 @@ class Agent:
                            "time. Choose a different action (another position, a shorter swipe, or another way).")
                 continue
             acts[0]["think_s"] = seconds
-            return [{**a, "_shot": frame} for a in acts]  # every action is drawn on the same screenshot
+            return [{**acts[0], "_shot": frame}]
         raise ValueError(f"actor gave no valid action: {reply[:200]}")
 
     async def _do(self, a: dict) -> None:

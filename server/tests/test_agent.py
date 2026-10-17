@@ -11,16 +11,15 @@ def test_parse_single_action():
                      "action": "tap", "x": 500, "y": 814}]
 
 
-def test_parse_several_actions_keeps_thought_on_first():
-    acts = parse_actions("THINK: Type and search.\nDO: type Whiteboard\nDO: key enter")
-    assert [a["action"] for a in acts] == ["type", "key"]
-    assert acts[0]["text"] == "Whiteboard" and acts[1]["combo"] == "enter"
-    assert "thought" not in acts[1]
+def test_parse_rejects_multiple_actions():
+    with pytest.raises(ValueError, match="exactly one DO action"):
+        parse_actions("THINK: Type and search.\nDO: type Whiteboard\nDO: key enter")
 
 
-def test_parse_caps_at_six_actions():
+def test_parse_never_caps_a_batch_into_several_actions():
     reply = "THINK: draw\n" + "\n".join(f"DO: tap {i} {i}" for i in range(10))
-    assert len(parse_actions(reply)) == 6
+    with pytest.raises(ValueError, match="exactly one DO action"):
+        parse_actions(reply)
 
 
 def test_parse_path_and_circle():
@@ -92,3 +91,151 @@ def test_repeating_a_move_that_keeps_changing_the_screen_is_not_stuck():
 def test_precise_tap_flag():
     assert parse_command("tap 120 640 precise") == {"action": "tap", "x": 120, "y": 640, "precise": True}
     assert "precise" not in parse_command("tap 120 640")
+
+
+def test_actor_batch_is_rejected_and_retried_with_one_action():
+    import asyncio
+
+    from hidagent.agent import Agent
+    from hidagent.debug import Trace
+
+    class Screen:
+        live, frame, aspect = True, b"jpeg", 0.7
+
+    class Actor:
+        model = "fake"
+
+        def __init__(self):
+            self.prompts = []
+
+        async def chat(self, system, text, image=None, max_tokens=600, temperature=0):
+            self.prompts.append(text)
+            if len(self.prompts) == 1:
+                return "THINK: draw\nDO: tap 1 2\nDO: circle 500 500 200\nDO: done ok"
+            return "THINK: look first\nDO: tap 5 6"
+
+    actor = Actor()
+    agent = Agent(phone=None, screen=Screen(), actor=actor, planner=actor, trace=Trace(None))
+    agent.task, agent.plan = "draw", "1. draw"
+    acts = asyncio.run(agent._next_actions())
+    assert acts[0]["action"] == "tap" and acts[0]["x"] == 5
+    assert "exactly one DO action" in actor.prompts[1]
+
+
+def test_done_needs_an_explicit_complete_verdict_from_the_verifier():
+    import asyncio
+
+    from hidagent.agent import Agent
+    from hidagent.debug import Trace
+
+    class Screen:
+        live, frame, aspect = True, b"jpeg", 0.7
+
+    class Model:
+        model = "fake"
+
+        def __init__(self, reply):
+            self.reply = reply
+
+        async def chat(self, system, text, image=None, max_tokens=600, temperature=0):
+            return self.reply
+
+    def verify(reply):
+        agent = Agent(phone=None, screen=Screen(), actor=Model(reply), planner=Model(reply), trace=Trace(None))
+        agent.task = "draw a smiley"
+        return asyncio.run(agent._verify("done"))
+
+    ok, detail, _, _ = verify("VERDICT: complete\nREASON: a smiley is visible on the canvas")
+    assert ok and "smiley" in detail
+    ok, detail, _, _ = verify("VERDICT: incomplete\nREASON: the canvas is blank")
+    assert not ok and "blank" in detail
+    ok, _, _, _ = verify("looks good to me")
+    assert not ok
+
+
+def test_each_action_is_checked_against_its_stated_intent():
+    import asyncio
+
+    from hidagent.agent import Agent
+    from hidagent.debug import Trace
+
+    class Screen:
+        live, frame, aspect = True, b"jpeg", 0.7
+
+    class Model:
+        model = "fake"
+
+        def __init__(self, reply):
+            self.reply = reply
+
+        async def chat(self, system, text, image=None, max_tokens=600, temperature=0):
+            return self.reply
+
+    def check(reply):
+        agent = Agent(phone=None, screen=Screen(), actor=Model(reply), planner=Model(reply), trace=Trace(None))
+        return asyncio.run(agent._validate_action({"action": "tap", "x": 1, "y": 2, "thought": "select the pen"}))
+
+    ok, detail, _, _ = check("VERDICT: ok\nREASON: the pen palette is now visible")
+    assert ok and "pen palette" in detail
+    ok, detail, _, _ = check("VERDICT: mismatch\nREASON: the Insert menu opened instead")
+    assert not ok and "Insert menu" in detail
+    ok, _, _, _ = check("unclear")
+    assert not ok
+
+
+def test_three_mismatches_restart_from_the_home_screen():
+    import asyncio
+
+    from hidagent.agent import Agent
+    from hidagent.debug import Trace
+
+    class Screen:
+        live, frame, aspect = True, b"jpeg", 0.7
+
+    class Model:
+        model = "fake"
+
+        async def chat(self, system, text, image=None, max_tokens=600, temperature=0):
+            return "VERDICT: ok\nREASON: fine"
+
+    calls = []
+
+    class Phone:
+        async def go_home(self):
+            calls.append("home")
+
+    agent = Agent(phone=Phone(), screen=Screen(), actor=Model(), planner=Model(), trace=Trace(None))
+    agent._attempts, agent._mismatches, agent.plan = 1, 3, "old"
+
+    async def replan(stuck=False):
+        calls.append(("replan", stuck))
+        agent.plan = "new"
+
+    agent._replan = replan
+    assert not asyncio.run(agent._restart())
+    assert calls == ["home", ("replan", True)]
+    assert agent._attempts == 2 and agent._mismatches == 0
+    assert agent._history_start == len(agent.steps)
+    assert agent.steps[-1]["action"] == "restart"
+
+
+def test_restart_is_bounded_so_a_loop_cannot_run_forever():
+    import asyncio
+
+    from hidagent.agent import Agent
+    from hidagent.debug import Trace
+
+    calls = []
+
+    class Screen:
+        live, frame, aspect = True, b"jpeg", 0.7
+
+    class Phone:
+        async def go_home(self):
+            calls.append("home")
+
+    agent = Agent(phone=Phone(), screen=Screen(), actor=None, planner=None, trace=Trace(None))
+    agent._attempts, agent._mismatches = 3, 3
+    assert asyncio.run(agent._restart())
+    assert calls == []
+    assert agent.steps[-1]["action"] == "fail"
