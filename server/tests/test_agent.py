@@ -254,3 +254,70 @@ def test_restart_is_bounded_so_a_loop_cannot_run_forever():
     assert asyncio.run(agent._restart())
     assert calls == []
     assert agent.steps[-1]["action"] == "fail"
+
+
+def test_grounding_failure_is_a_step_check_error():
+    import asyncio
+    from types import SimpleNamespace
+
+    from hidagent.agent import Agent, StepCheckError
+    from hidagent.debug import Trace
+
+    async def locate(*args):
+        raise RuntimeError("intended tap target was not located")
+
+    import hidagent.agent as module
+    original = module.locate_tap
+    module.locate_tap = locate
+    try:
+        agent = Agent(phone=None, screen=SimpleNamespace(live=True, frame=b"old"),
+                      actor=None, planner=None, trace=Trace(None))
+        with pytest.raises(StepCheckError, match="not located"):
+            asyncio.run(agent._ground_tap({"action": "tap", "x": 620, "y": 50}, b"old"))
+    finally:
+        module.locate_tap = original
+
+
+def test_failed_toolbar_check_is_counted_and_hinted_to_the_actor():
+    import asyncio
+
+    from hidagent.agent import Agent
+    from hidagent.debug import Trace
+
+    class Actor:
+        model = "fake"
+
+        def __init__(self):
+            self.prompts = []
+
+        async def chat(self, system, text, image=None, max_tokens=600, temperature=0):
+            self.prompts.append(text)
+            return "THINK: try another icon\nDO: tap 540 50"
+
+    class Screen:
+        live, frame, aspect = True, b"jpeg", 0.7
+
+    restarted = []
+
+    async def restart():
+        restarted.append(True)
+        return False
+
+    actor = Actor()
+    agent = Agent(phone=None, screen=Screen(), actor=actor, planner=actor, trace=Trace(None))
+    agent.task, agent.plan = "draw", "1. draw"
+    agent._restart = restart
+    agent._mismatches, agent._toolbar_failed = 0, None
+
+    # The failed toolbar check sets the hint and, on the third failure, triggers a restart.
+    assert not asyncio.run(agent._step_check_failed({"action": "tap", "x": 620, "y": 50}, "the Insert menu opened"))
+    assert agent._toolbar_failed == 620
+    assert "the Insert menu opened" in agent._last_validation
+    agent._mismatches = 2
+    assert not asyncio.run(agent._step_check_failed({"action": "tap", "x": 620, "y": 50}, "still wrong"))
+    assert restarted == [True]
+
+    acts = asyncio.run(agent._next_actions())
+    assert acts[0]["x"] == 540
+    assert acts[0]["explore"] is True  # keep the neighbor x; do not let grounding snap back
+    assert "Do not tap that same x again" in actor.prompts[-1]

@@ -41,6 +41,8 @@ Aim at the visual center of the element you want, not its edge or its label.
 Look before you act: describe what is really on the screen now, not what you expect.
 Do not assume where a toolbar button is because it was there on another device or app; read the
 current screen. After opening a menu, look at what it contains instead of repeating the same tap.
+If a toolbar tap does not select the intended tool, do not tap the same position again; try the
+nearest different toolbar icon to its left or right, one at a time, and inspect what it opens.
 Before path or circle, the drawing tool must be visibly selected and no menu may be open. If a menu
 opened or a shape got selected instead, close it and choose the actual tool again.
 Each recent action says whether the screen changed after it. If it did NOT change, the action
@@ -95,7 +97,10 @@ VERDICT: mismatch
 REASON: <what is actually visible instead, and why it does not match>"""
 
 META = ("t", "thought", "thought_zh", "think_s", "act_s", "shot", "_shot", "changed", "validated",
-        "validation", "validate_s", "verified", "verification", "verify_s", "ground_s", "proposed")  # not the action
+        "validation", "validate_s", "verified", "verification", "verify_s", "ground_s", "proposed",
+        "explore")  # not the action
+
+TOOLBAR_BAND = 180  # y (0-1000) below which a tap is treated as a toolbar/top-bar target
 
 # action name -> argument names; numeric arguments are 0-1000 screen coordinates
 ACTIONS = {"tap": ("x", "y"), "swipe": ("x1", "y1", "x2", "y2"), "circle": ("x", "y", "r"), "path": ("points",),
@@ -154,6 +159,10 @@ class BlindError(RuntimeError):
     """The screen feed is gone; acting now would be guessing."""
 
 
+class StepCheckError(RuntimeError):
+    """An action could not be grounded or checked; count it like a failed step check and restart later."""
+
+
 class Agent:
     def __init__(self, phone: Phone, screen: Screen, actor: LLM, planner: LLM, trace: Trace,
                  max_steps: int = 40, max_failures: int = 3, max_attempts: int = 3):
@@ -167,6 +176,7 @@ class Agent:
         self._attempts, self._mismatches = 1, 0
         self._history_start = 0  # steps before this belong to an abandoned attempt
         self._last_validation = ""
+        self._toolbar_failed: int | None = None  # x of the last toolbar tap that did not do what was intended
         self._failure_notes: list[str] = []  # failed checks in the current attempt
         self._failed_attempts: list[tuple[int, list[str]]] = []
 
@@ -183,6 +193,7 @@ class Agent:
         self._pointer = (0.0, 0.0)
         self._attempts, self._mismatches = 1, 0
         self._history_start, self._last_validation = 0, ""
+        self._toolbar_failed = None
         self._failure_notes, self._failed_attempts = [], []
         self.trace.start(task)
         self._job = asyncio.create_task(self._run())
@@ -261,8 +272,11 @@ class Agent:
         if act["action"] == "fail":
             self._record(shot, **act)
             return True
-        if act["action"] == "tap":
-            act = await self._ground_tap(act, shot)
+        if act["action"] == "tap" and not act.get("explore"):
+            try:
+                act = await self._ground_tap(act, shot)
+            except StepCheckError as e:
+                return await self._step_check_failed(act, str(e))
         started = time.time()
         await self._do(act)
         act["act_s"] = round(time.time() - started, 2)
@@ -282,9 +296,17 @@ class Agent:
             self.steps[-1]["validate_s"] = seconds
         if ok:
             self._last_validation = ""
+            if act["action"] == "tap" and act.get("y", 1000) < TOOLBAR_BAND:
+                self._toolbar_failed = None
             return False
+        return await self._step_check_failed(act, reason)
+
+    async def _step_check_failed(self, act: dict, reason: str) -> bool:
+        """Count a failed step check; after three, restart from the home screen."""
         self._mismatches += 1
         self._last_validation = reason
+        if act.get("action") == "tap" and act.get("y", 1000) < TOOLBAR_BAND:
+            self._toolbar_failed = act.get("x")
         self._failure_notes.append(f"{act.get('action')} {json.dumps(_key(act))} -> {reason}"[:300])
         self._record(action="hiccup", reason=f"step check: {reason}"[:300])
         if self._mismatches >= 3:
@@ -314,6 +336,7 @@ class Agent:
         self._record(action="restart", reason=f"three step checks failed; restarting attempt "
                                               f"{self._attempts}/{self.max_attempts} from the home screen")
         self._mismatches, self._last_validation = 0, ""
+        self._toolbar_failed = None
         self._pointer, self.plan = (0.0, 0.0), ""
         try:
             await self.phone.go_home()
@@ -325,11 +348,14 @@ class Agent:
 
     async def _ground_tap(self, action: dict, frame: bytes) -> dict:
         """Refine a tap against the screenshot the actor decided on; never click a stale screen."""
-        refined = await locate_tap(self.actor, frame, action, self.trace)
+        try:
+            refined = await locate_tap(self.actor, frame, action, self.trace)
+        except (RuntimeError, ValueError) as e:
+            raise StepCheckError(str(e)) from e
         if not self.screen.live:
             raise BlindError("lost the phone screen: reconnect Screen Mirroring")
         if self.screen.frame != frame and vision.scene_changed(frame, self.screen.frame):
-            raise RuntimeError("screen changed while locating the target; discard the tap and observe again")
+            raise StepCheckError("screen changed while locating the target; discard the tap and observe again")
         return refined
 
     async def _verify(self, answer: str) -> tuple[bool, str, float, bytes | None]:
@@ -346,7 +372,7 @@ class Agent:
     def _history(self, limit: int = 8) -> str:
         hidden = ("t", "plan", "plan_zh", "think_s", "act_s", "shot", "_shot", "thought", "thought_zh",
                   "changed", "validated", "validation", "validate_s", "verified", "verification",
-                  "verify_s", "ground_s", "proposed")
+                  "verify_s", "ground_s", "proposed", "explore")
         effect = {True: " -> screen changed", False: " -> screen did NOT change"}
         return "\n".join(json.dumps({k: v for k, v in s.items() if k not in hidden})[:300]
                          + effect.get(s.get("changed"), "")
@@ -395,6 +421,10 @@ class Agent:
         if self._last_validation:
             prompt += (f"\n\nIndependent check of your last action: {self._last_validation}\n"
                        "The visible result did not match your intent; correct that before continuing.")
+        if self._toolbar_failed is not None:
+            prompt += (f"\n\nThe last toolbar tap near x={self._toolbar_failed} did not select the intended tool. "
+                       "Do not tap that same x again; try a different toolbar icon, nearest left or right, "
+                       "one at a time, and inspect what it opens.")
         for attempt in range(3):  # retry unparseable replies, a little less deterministically
             reply, seconds, frame = await self._ask("actor", self.actor, ACTOR_PROMPT, prompt, 0.4 * attempt)
             try:
@@ -409,6 +439,15 @@ class Agent:
                 prompt += (f"\n\nYou just proposed {json.dumps(_key(acts[0]))} again, but it changed nothing last "
                            "time. Choose a different action (another position, a shorter swipe, or another way).")
                 continue
+            if (
+                acts[0]["action"] == "tap"
+                and acts[0].get("y", 1000) < TOOLBAR_BAND
+                and self._toolbar_failed is not None
+                and abs(acts[0].get("x", 0) - self._toolbar_failed) > 40
+            ):
+                # A deliberately different toolbar icon is an exploration tap: keep its x and
+                # observe what it opens instead of letting semantic grounding snap back.
+                acts[0]["explore"] = True
             acts[0]["think_s"] = seconds
             return [{**acts[0], "_shot": frame}]
         raise ValueError(f"actor gave no valid action: {reply[:200]}")
