@@ -21,7 +21,7 @@ class Axis:
 
 def fit_axis(samples):
     if len(samples) < 3:
-        raise ValueError("not enough pointer observations")
+        raise ValueError(f"not enough pointer observations ({len(samples)}; need at least 3)")
     units, fractions = zip(*samples, strict=True)
     mu, mf = sum(units) / len(units), sum(fractions) / len(fractions)
     variance = sum((u - mu) ** 2 for u in units)
@@ -117,11 +117,16 @@ class Calibration:
             if not found:
                 # A wallpaper or hover target can make one location unobservable. Move to another
                 # held-out point in the same height band, retaining the bottom-edge check.
-                target = (min(.9, target[0] + .08), target[1] if target[1] > .95 else target[1] + .06)
+                if target[1] > .95:
+                    # The white home indicator runs through the bottom center and merges with the
+                    # pointer in the diff, so keep the height but move to a clear side.
+                    target = (.82 if target[0] <= .5 else .18, target[1])
+                else:
+                    target = (min(.9, target[0] + .08), target[1] + .06)
                 await self.move(*(axis.units(f) for axis, f in zip(axes, target, strict=True)))
                 found = await self.observe(target, axes[0].span)
                 if not found:
-                    raise RuntimeError("could not observe the pointer at a verification point")
+                    raise RuntimeError(f"could not observe the pointer at verification point {target}")
             error = max(abs(found[i] - target[i]) for i in (0, 1))
             self.checks.append({"target": list(target), "observed": list(found), "error": error})
             if error > TOLERANCE:

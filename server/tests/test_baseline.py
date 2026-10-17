@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image, ImageDraw
 
-from hidagent.calibration import Axis, fit_axis
+from hidagent.calibration import Axis, Calibration, fit_axis
 from hidagent.device import DeviceError
 from hidagent.phone import Phone
 from hidagent.screen import Screen
@@ -18,6 +18,30 @@ def test_fit_measures_scale_and_offset_without_clamping_the_corrected_edge():
     assert axis.offset == pytest.approx(-.02)
     assert axis.units(.995) == 2030  # clipping at span would miss the bottom
     assert Axis(1000, 0).units(2) == 1000  # only the requested fraction is clamped
+
+
+def test_bottom_edge_verification_retries_at_the_same_height_clear_of_the_home_indicator():
+    class Fake(Calibration):
+        async def send(self, command):
+            pass
+
+        async def move(self, x, y):
+            self.pos = (x, y)
+
+        async def observe(self, near=None, span=None):
+            if near is None:  # measurement: a perfect 1000 x 2000 mapping
+                return self.pos[0] / 1000, self.pos[1] / 2000
+            if tuple(near) == (0.5, 0.99):  # the home indicator hides the pointer here
+                return None
+            if tuple(near) == (0.82, 0.99):  # the same-height retry is observable
+                return (0.82, 0.99)
+            return tuple(near)
+
+    screen = SimpleNamespace(live=True, geometry=(752, 1080))
+    result = asyncio.run(Fake(SimpleNamespace(), screen, (1000, 2000)).run())
+    bottom = result["checks"][2]
+    assert bottom["target"] == [0.82, 0.99]  # height kept, moved away from the indicator
+    assert bottom["observed"] == [0.82, 0.99]
 
 
 @pytest.mark.parametrize('samples', [
