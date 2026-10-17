@@ -16,14 +16,17 @@ If the target is not visible or is ambiguous, return NOT_FOUND."""
 
 
 async def locate_tap(llm, frame: bytes, action: dict, trace) -> dict:
-    """Only refine within a bounded neighborhood; no match means no click."""
+    """Refine a tap near the proposal; toolbar taps search the whole band, so a wrong x can be corrected."""
     image = Image.open(io.BytesIO(frame)).convert("RGB")
     w, h = image.size
     x, y = action["x"], action["y"]
     if not 0 <= x <= 1000 or not 0 <= y <= 1000:
         raise ValueError("tap coordinates must be within 0-1000")
-    box = (max(0, int((x-200)*w/1000)), max(0, int((y-150)*h/1000)),
-           min(w, int((x+200)*w/1000)), min(h, int((y+150)*h/1000)))
+    if y < 180:  # top toolbar: icons are small and a guessed x is often on the wrong one
+        box = (0, 0, w, min(h, max(120, int(0.2*h))))
+    else:
+        box = (max(0, int((x-200)*w/1000)), max(0, int((y-150)*h/1000)),
+               min(w, int((x+200)*w/1000)), min(h, int((y+150)*h/1000)))
     crop = image.crop(box).resize((1000, 1000), Image.Resampling.LANCZOS)
     output = io.BytesIO()
     crop.save(output, format="JPEG", quality=90)

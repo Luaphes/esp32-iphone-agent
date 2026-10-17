@@ -206,6 +206,7 @@ def test_three_mismatches_restart_from_the_home_screen():
 
     agent = Agent(phone=Phone(), screen=Screen(), actor=Model(), planner=Model(), trace=Trace(None))
     agent._attempts, agent._mismatches, agent.plan = 1, 3, "old"
+    agent._failure_notes = ["tap at 620,46 -> the Insert menu opened"]
 
     async def replan(stuck=False):
         calls.append(("replan", stuck))
@@ -217,6 +218,20 @@ def test_three_mismatches_restart_from_the_home_screen():
     assert agent._attempts == 2 and agent._mismatches == 0
     assert agent._history_start == len(agent.steps)
     assert agent.steps[-1]["action"] == "restart"
+    assert agent._failed_attempts == [(1, ["tap at 620,46 -> the Insert menu opened"])]
+
+
+def test_failure_summary_tells_the_planner_what_already_failed():
+    from hidagent.agent import Agent
+    from hidagent.debug import Trace
+
+    agent = Agent(phone=None, screen=None, actor=None, planner=None, trace=Trace(None))
+    agent._failed_attempts = [(1, ["tap at 620,46 -> the Insert menu opened"]),
+                              (2, ["tap at 692,46 -> the Discover panel opened"])]
+    summary = agent._failure_summary()
+    assert "Attempt 1" in summary and "Insert menu" in summary
+    assert "Attempt 2" in summary and "Discover panel" in summary
+    assert "Do not repeat" in summary
 
 
 def test_restart_is_bounded_so_a_loop_cannot_run_forever():

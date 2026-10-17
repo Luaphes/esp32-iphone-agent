@@ -167,6 +167,8 @@ class Agent:
         self._attempts, self._mismatches = 1, 0
         self._history_start = 0  # steps before this belong to an abandoned attempt
         self._last_validation = ""
+        self._failure_notes: list[str] = []  # failed checks in the current attempt
+        self._failed_attempts: list[tuple[int, list[str]]] = []
 
     @property
     def running(self) -> bool:
@@ -181,6 +183,7 @@ class Agent:
         self._pointer = (0.0, 0.0)
         self._attempts, self._mismatches = 1, 0
         self._history_start, self._last_validation = 0, ""
+        self._failure_notes, self._failed_attempts = [], []
         self.trace.start(task)
         self._job = asyncio.create_task(self._run())
 
@@ -282,6 +285,7 @@ class Agent:
             return False
         self._mismatches += 1
         self._last_validation = reason
+        self._failure_notes.append(f"{act.get('action')} {json.dumps(_key(act))} -> {reason}"[:300])
         self._record(action="hiccup", reason=f"step check: {reason}"[:300])
         if self._mismatches >= 3:
             return await self._restart()
@@ -305,6 +309,8 @@ class Agent:
                                                "no restart attempts left")
             return True
         self._attempts += 1
+        self._failed_attempts.append((self._attempts - 1, self._failure_notes[-6:]))
+        self._failure_notes = []
         self._record(action="restart", reason=f"three step checks failed; restarting attempt "
                                               f"{self._attempts}/{self.max_attempts} from the home screen")
         self._mismatches, self._last_validation = 0, ""
@@ -365,10 +371,23 @@ class Agent:
             last = self.steps[-1] if self.steps else {}
             prompt += (f"\n\nThe previous plan got stuck (last event: {last.get('action')} {last.get('reason', '')}):"
                        f"\n{self.plan}\nLook at the current screen and plan from here, another way if needed.")
+            summary = self._failure_summary()
+            if summary:
+                prompt += "\n\n" + summary
         reply, seconds, frame = await self._ask("planner", self.planner, PLANNER_PROMPT, prompt)
         self.plan, plan_zh = parse_plan(reply)
         self._record(frame, action="replan (stuck)" if stuck else "plan", plan=self.plan, plan_zh=plan_zh,
                      think_s=seconds)
+
+    def _failure_summary(self) -> str:
+        if not self._failed_attempts:
+            return ""
+        lines = ["Previous attempts failed. Do not repeat these methods; choose a different visible target "
+                 "or input method:"]
+        for attempt, notes in self._failed_attempts[-2:]:
+            lines.append(f"Attempt {attempt}:")
+            lines.extend(f"- {note}" for note in notes)
+        return "\n".join(lines)
 
     async def _next_actions(self) -> list[dict]:
         prompt = (f"Goal: {self.task}\n\nPlan:\n{self.plan}\n\nRecent actions:\n{self._history()}"

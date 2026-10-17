@@ -40,6 +40,15 @@ def test_crop_point_maps_back_to_original_screen(reply):
     assert proposed["x"] == 178
 
 
+def test_toolbar_tap_searches_the_whole_toolbar_band():
+    llm = Locator("POINT 250 500")
+    result = asyncio.run(locate_tap(llm, frame(), {"action": "tap", "x": 620, "y": 50,
+                                                    "thought": "the drawing tool"}, Trace(None)))
+    # The full 752-pixel toolbar is the crop; 250/1000 of it is the left-side pen (screen x=0.25).
+    assert (result["x"], result["y"]) == (250, 100)
+    assert result["proposed"] == {"x": 620, "y": 50}
+
+
 @pytest.mark.parametrize("reply", ["NOT_FOUND", "POINT 1001 200", "POINT 0 200", "maybe POINT 200 300"])
 def test_uncertain_or_outside_crop_never_becomes_a_tap(reply):
     with pytest.raises(RuntimeError, match="not located"):
