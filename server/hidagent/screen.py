@@ -26,8 +26,21 @@ class Screen:
 
     def stop(self) -> None:
         self._stopping = True
-        if self._proc:
-            self._proc.terminate()
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            # UxPlay can be stuck in GStreamer while mirroring; then it never handles SIGTERM
+            # and would survive us, keeping AirPlay's name and port busy for the next start.
+            log.warning("AirPlay receiver ignored SIGTERM (pid %d), killing", proc.pid)
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                log.error("AirPlay receiver would not exit (pid %d)", proc.pid)
 
     def _supervise(self) -> None:
         """Keep UxPlay running: it exits on some disconnects, so restart it every time."""
@@ -43,6 +56,9 @@ class Screen:
             self._read(read_fd)  # returns when UxPlay closes the pipe
             code = self._proc.wait()
             self.frame = None
+            if self._stopping:
+                log.info("AirPlay receiver stopped (code %s)", code)
+                return
             log.warning("AirPlay receiver exited (code %s), restarting", code)
             time.sleep(1)
 

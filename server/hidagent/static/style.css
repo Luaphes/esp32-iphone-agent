@@ -56,18 +56,19 @@ main { display: grid; grid-template-columns: auto minmax(300px, 1fr) minmax(420p
 
 /* 3. work */
 .work { display: flex; flex-direction: column; gap: 16px; }
-.top { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
+.top { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px 12px; align-items: center; }
+.top > div:first-child { flex: 1 1 180px; min-width: 0; }
 .top p { margin: 2px 0 0; color: var(--muted); }
-.lang { display: flex; flex: none; }
-.models { display: flex; gap: 8px; margin-left: auto; }
-.models div { border: 1px solid var(--line); border-radius: 10px; padding: 4px 10px; display: flex; flex-direction: column; min-width: 150px; }
+.lang { display: flex; flex: none; order: 3; }
+.models { display: flex; flex: 1 0 100%; order: 4; gap: 8px; margin-left: 0; }
+.models div { flex: 1 1 0; min-width: 0; border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; display: flex; flex-direction: column; }
 .models span { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
-.models b { font-size: 13px; white-space: nowrap; }
+.models b { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .models small { font: 11px ui-monospace, monospace; color: var(--muted); }
 .hand { position: absolute; transform: translate(-30%, -8%); font-size: 34px; line-height: 1;
         filter: drop-shadow(0 0 2px #000) drop-shadow(0 2px 2px #000); animation: press 1.4s ease-in-out infinite; }
 dialog .hand { font-size: 72px; }
-.motion { font-size: 12px; padding: 4px 10px; flex: none; }
+.motion { font-size: 12px; padding: 4px 10px; flex: none; order: 2; margin-left: auto; }
 
 /* motion: a ripple spreads from each tap, dashes travel along swipes and strokes */
 .ripple { transform-box: fill-box; transform-origin: center; animation: ripple 1.4s ease-out infinite; }

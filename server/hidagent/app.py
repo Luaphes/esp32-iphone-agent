@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from .agent import Agent
 from .debug import Trace
 from .device import Device, DeviceError
+from .keyboard import prepare_text
 from .llm import LLM
 from .phone import Phone
 from .screen import Screen
@@ -93,10 +94,12 @@ async def act(action):
     check_manual()
     try:
         async with manual_lock:
-            await action()
+            result = await action()
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
     except (DeviceError, RuntimeError) as e:
         raise HTTPException(409, str(e)) from e
-    return {"ok": True}
+    return {"ok": True, **({"input": result} if result else {})}
 
 
 @app.get("/")
@@ -128,7 +131,7 @@ def step_shot(index: int):
 
 @app.post("/api/tap")
 async def tap(p: Point):
-    return await act(lambda: phone.tap(p.x, p.y))
+    return await act(lambda: phone.tap(p.x, p.y, aim=True))
 
 
 @app.post("/api/swipe")
@@ -143,7 +146,10 @@ async def scroll(s: Scroll):
 
 @app.post("/api/type")
 async def type_text(t: KeyboardText):
-    check_keyboard(t.text)
+    try:
+        prepare_text(t.text)
+    except ValueError as e:
+        raise HTTPException(422, str(e)) from e
     return await act(lambda: phone.type(t.text))
 
 
@@ -187,8 +193,8 @@ async def calibrate_finish(p: Point):
     check_manual()
     if not 0 < p.x < 1 or not 0 < p.y < 1:
         raise HTTPException(422, "calibration pointer must be inside the screen")
-    phone.finish_calibration(p.x, p.y)
-    return {"ok": True, "span": phone.span}
+    result = await act(lambda: phone.finish_calibration(p.x, p.y))
+    return {**result, "span": phone.span}
 
 
 @app.post("/api/agent")
@@ -206,11 +212,9 @@ async def agent_start(t: Text):
 async def agent_stop():
     """Emergency stop: cancel the agent and release the mouse button."""
     agent.stop()
-    await asyncio.sleep(0.1)  # let a gesture in flight finish its own release
     # Emergency stop must stay available even while a direct action holds the lock.
     try:
-        if device.connected:
-            await phone.reset()
+        await phone.reset()
     except (DeviceError, RuntimeError) as e:
         raise HTTPException(409, str(e)) from e
     return {"ok": True}

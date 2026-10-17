@@ -9,6 +9,10 @@ import httpx
 TOKEN_PARAMS = ("max_tokens", "max_completion_tokens")
 
 
+class LLMResponseError(RuntimeError):
+    """The endpoint returned no complete, usable assistant response."""
+
+
 class LLM:
     def __init__(self, base_url: str, model: str, api_key: str = "", extra: dict | None = None,
                  token_param: str = "auto"):
@@ -39,4 +43,20 @@ class LLM:
             self.token_param, self._auto = "max_completion_tokens", False
             r = await self._http.post("/chat/completions", json={self.token_param: max_tokens, **body})
         r.raise_for_status()
-        return r.json()["choices"][0]["message"]["content"] or ""
+        data = r.json()
+        choices = data.get("choices") if isinstance(data, dict) else None
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            raise LLMResponseError("LLM response has no usable choices[0]")
+        choice = choices[0]
+        if choice.get("finish_reason") == "length":
+            raise LLMResponseError("LLM response truncated (finish_reason=length); partial actions were discarded")
+        if choice.get("finish_reason") not in (None, "stop"):
+            raise LLMResponseError(f"LLM response has unusable finish_reason={choice['finish_reason']}; "
+                                   "partial actions were discarded")
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            raise LLMResponseError("LLM response is missing choices[0].message")
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise LLMResponseError("LLM response has no usable text in choices[0].message.content")
+        return content

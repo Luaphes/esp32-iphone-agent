@@ -8,6 +8,8 @@ __pycache__/
 # Local config and secrets
 .env
 hardware/hid_bridge/secrets.h
+.local/
+.tools/
 
 # Build output
 hardware/build/

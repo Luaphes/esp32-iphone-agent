@@ -191,15 +191,31 @@ command per line over TCP and the board answers `ok` or `err <reason>`.
 |---|---|
 | `ping` | Health check |
 | `home` | Push the pointer into the top-left corner (a known position) |
+| `homescreen` | Send Apple Home (Consumer Menu, 0x0040) for iPhone / iPad |
 | `move <dx> <dy>` | Relative pointer move, at a constant pace so iOS pointer acceleration stays predictable |
 | `press` / `release` / `click` | Left button down / up / both |
 | `scroll <v> <h>` | Scroll wheel |
 | `type <text>` | Type ASCII text |
-| `key <combo>` | Press keys, e.g. `enter`, `cmd+h`, `cmd+space` |
+| `key <combo>` | Press keys, e.g. `enter`, `ctrl+space`; `globe` selects input sources, `keyboard` toggles the onscreen keyboard |
 
 If the Wi-Fi link drops, the board releases all buttons and reconnects on its own. While the phone is locked, its USB
 port sleeps: the board then tries to wake it and otherwise answers `err phone usb asleep` instead of waiting. A watchdog
 restarts the board if it ever stops responding.
+
+The web UI and agent's Home action use `homescreen`, independent of pointer calibration. Flash the updated firmware
+alongside this server change; older firmware reports an unsupported command. The protocol's `home` still only resets
+the mouse pointer and must not be used as a phone navigation action.
+
+Server-side `type 美团` sends `mei'tuan` through the system Chinese Pinyin keyboard, leaving the candidate
+uncommitted. The agent must inspect and select the exact characters, then verify the field. Manual users select
+the candidate themselves. Enable and select Chinese Pinyin first. Each entry accepts 1–12 Chinese characters;
+split mixed scripts into separate entries. Emoji and other unsupported characters need the onscreen keyboard.
+The firmware rejects raw UTF-8 instead of turning its bytes into unrelated key presses.
+
+iPad uses the same firmware and AirPlay architecture. The preview follows the actual frame aspect ratio.
+Recalibrate after changing device, orientation, or pointer tracking speed. Calibration from a different aspect
+ratio is rejected; devices sharing the same aspect ratio still require manual recalibration. See the
+[validation record](docs/iOS控制验证记录.md) for actual hardware verification status.
 
 ## Project layout
 
@@ -212,8 +228,8 @@ server/     agent, web UI, screen capture and board link (Python, FastAPI)
 ## Roadmap
 
 - [ ] Test a fully local setup with DiffusionGemma (`server/serve/` has an experimental OpenAI-compatible server)
-- [ ] Landscape apps (screen coordinates and calibration assume portrait)
-- [ ] Non-ASCII text input (e.g. Chinese through the iOS pinyin keyboard)
+- [ ] Validate iPad and landscape pointer/candidate selection reliability
+- [ ] Broader Chinese input coverage (currently short Pinyin phrases with candidate confirmation)
 - [ ] More example tasks across popular apps
 
 ### Exploring: drop the computer
@@ -228,9 +244,9 @@ These are directions, not promises. If you're interested, or you've tried someth
 
 - iOS does not mirror some screens (passcode entry, Apple Pay, DRM video); the agent cannot see them.
 - Mirroring stops when the phone locks; keep auto-lock off while the agent works.
-- Keyboard input is ASCII only.
+- The firmware accepts ASCII only; the server composes short Chinese phrases through the system Pinyin keyboard.
 - Re-calibrate after changing AssistiveTouch tracking speed.
-- Landscape apps are not supported yet: drawings and taps there land in the wrong place.
+- Recalibrate after rotating the screen; automatic rotation calibration is not implemented.
 - On Linux machines with several network interfaces, limit Avahi (mDNS) to the interface on the phone's network
   if the phone does not list the receiver.
 

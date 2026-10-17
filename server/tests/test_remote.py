@@ -19,11 +19,12 @@ def api(tmp_path, monkeypatch):
     class Phone:
         span = {"w": 400, "h": 800}
         calibrated = True
-        async def tap(self, x, y): calls.append(("tap", x, y))
+        async def tap(self, x, y, aim=False): calls.append(("tap", x, y))
         async def type(self, text): calls.append(("type", text))
         async def key(self, text): calls.append(("key", text))
         async def start_calibration(self): return True
-        def finish_calibration(self, x, y): calls.append(("calibrate", x, y))
+        async def finish_calibration(self, x, y): calls.append(("calibrate", x, y))
+        async def reset(self): pass
 
     class Agent:
         running, task, steps = False, "", []
@@ -105,7 +106,8 @@ def test_direct_action_and_agent_start_cannot_interleave(api, monkeypatch):
     async def scenario():
         entered, release = asyncio.Event(), asyncio.Event()
 
-        async def tap(x, y):
+        async def tap(x, y, aim=False):
+            assert aim is True
             entered.set()
             await release.wait()
             calls.append(("tap", x, y))
@@ -134,7 +136,7 @@ def test_direct_action_and_agent_start_cannot_interleave(api, monkeypatch):
     ("/api/scroll", {"x": .5, "y": .5, "lines": 101}),
     ("/api/type", {"text": "Calendar\nhome"}),
     ("/api/key", {"text": "enter\rhome"}),
-    ("/api/type", {"text": "你好"}),
+    ("/api/type", {"text": "你好😀"}),
     ("/api/type", {"text": "\u007f"}),
     ("/api/calibrate/finish", {"x": 0, "y": .5}),
 ])
@@ -146,4 +148,56 @@ def test_invalid_remote_input_is_rejected_before_hid(api, path, body):
             assert (await client.post(path, json=body)).status_code == 422
         assert not calls
 
+    asyncio.run(scenario())
+
+
+def test_chinese_api_returns_uncommitted_candidate_status(api, monkeypatch, tmp_path):
+    from hidagent.phone import Phone
+
+    module, commands = api
+
+    async def send(command): commands.append(command)
+
+    monkeypatch.setattr(module, "phone", Phone(SimpleNamespace(send=send), tmp_path / "calibration.json"))
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=module.app), base_url="http://legacy") as client:
+            response = await client.post("/api/type", json={"text": "美团"})
+            assert response.status_code == 200
+            assert response.json()["input"] == {
+                "mode": "pinyin", "target": "美团", "keys": "mei'tuan", "needs_confirmation": True}
+        assert commands == ["type mei'tuan"]
+
+    asyncio.run(scenario())
+
+
+def test_manual_calibration_waits_for_probe_and_excludes_other_actions(api, monkeypatch):
+    module, calls = api
+    async def scenario():
+        entered, finish = asyncio.Event(), asyncio.Event()
+        async def calibrate(x, y):
+            entered.set()
+            await finish.wait()
+            calls.append(("calibrate", x, y))
+        monkeypatch.setattr(module.phone, "finish_calibration", calibrate)
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=module.app), base_url="http://legacy") as client:
+            pending = asyncio.create_task(client.post("/api/calibrate/finish", json={"x": .4, "y": .4}))
+            await entered.wait()
+            assert not pending.done()
+            assert (await client.post("/api/agent", json={"text": "Open Clock"})).status_code == 409
+            assert (await client.post("/api/tap", json={"x": .5, "y": .5})).status_code == 409
+            finish.set()
+            response = await pending
+            assert response.status_code == 200 and response.json()["span"] == module.phone.span
+    asyncio.run(scenario())
+
+
+def test_failed_manual_probe_is_retryable_api_error(api, monkeypatch):
+    module, calls = api
+    async def fail(x, y): raise RuntimeError("pointer not visible; retry")
+    monkeypatch.setattr(module.phone, "finish_calibration", fail)
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=module.app), base_url="http://legacy") as client:
+            response = await client.post("/api/calibrate/finish", json={"x": .4, "y": .4})
+            assert response.status_code == 409 and "retry" in response.json()["detail"]
     asyncio.run(scenario())

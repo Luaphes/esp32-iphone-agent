@@ -1,5 +1,6 @@
 // Control page: live phone, bilingual live log, and a wall of step screenshots.
 const $ = (id) => document.getElementById(id);
+let currentStatus = null, starting = false, findingPointer = false, startCancelled = false, pendingTask = null;
 
 // ---- language ------------------------------------------------------------------------
 
@@ -20,6 +21,7 @@ function applyLang() {
   }));
   shown = "";  // re-render steps in the new language
   if (typeof applyMotion === "function") applyMotion();
+  updateTaskControls();
 }
 document.querySelectorAll("#lang button").forEach((b) => b.addEventListener("click", () => {
   lang = b.dataset.lang;
@@ -43,10 +45,15 @@ $("motion").addEventListener("click", () => {
 
 const say = (key) => { $("msg").textContent = key ? t(key) : ""; };
 async function post(path, body) {
-  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
-  const data = await r.json().catch(() => ({}));
-  $("msg").textContent = r.ok ? "" : data.detail || r.statusText;
-  return r.ok ? data : null;
+  try {
+    const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+    const data = await r.json().catch(() => ({}));
+    $("msg").textContent = r.ok ? "" : data.detail || r.statusText;
+    return r.ok ? data : null;
+  } catch {
+    say("serverOffline");
+    return null;
+  }
 }
 
 // ---- step helpers --------------------------------------------------------------------
@@ -173,10 +180,25 @@ live.addEventListener("pointerup", async (e) => {
   if (!down) return;
   const up = frac(e), from = down;
   down = null;
+  if (findingPointer) return;
   if (calibrating) {
-    calibrating = false;
-    const ok = await post("/api/calibrate/finish", up);
-    calibrationHint(ok ? "calOk" : null);
+    findingPointer = true;
+    updateTaskControls();
+    let resume = null;
+    try {
+      const ok = await post("/api/calibrate/finish", up);
+      if (ok) {
+        calibrating = false;
+        if (currentStatus) currentStatus.calibrated = true;
+        resume = pendingTask;  // the task that asked for calibration waits for this click
+        pendingTask = null;
+      }
+      calibrationHint(ok ? "calOk" : "calNow");
+    } finally {
+      findingPointer = false;
+      updateTaskControls();
+    }
+    if (resume) start(resume);
   } else if (Math.hypot(up.x - from.x, up.y - from.y) < 0.02) {
     post("/api/tap", up);
   } else {
@@ -201,6 +223,11 @@ function showFrame(url) {
 
 // Keep fetching the latest frame (works in every browser, unlike MJPEG).
 async function refreshLive() {
+  if (currentStatus && !currentStatus.screen) {  // no mirroring: don't hammer the server with 404s
+    showFrame("");
+    setTimeout(refreshLive, 500);
+    return;
+  }
   try {
     const r = await fetch(`/api/frame.jpg?${Date.now()}`);
     showFrame(r.ok ? URL.createObjectURL(await r.blob()) : "");
@@ -218,46 +245,118 @@ function calibrationHint(key) {
   live.parentElement.classList.toggle("calibrating", key === "calNow");
   if (key === "calOk") setTimeout(() => calibrationHint(null), 4000);
 }
-$("cal").addEventListener("click", async () => {
+async function calibrate() {
+  findingPointer = true;
+  calibrating = false;
+  updateTaskControls();
   calibrationHint("calFinding");
-  const r = await post("/api/calibrate/start");
-  if (!r) return calibrationHint(null);
-  if (r.auto) return calibrationHint("calOk");  // found the pointer by itself
-  calibrating = true;
-  calibrationHint("calNow");
+  try {
+    const r = await post("/api/calibrate/start");
+    if (!r || (starting && startCancelled)) {
+      calibrationHint(null);
+      return false;
+    }
+    if (r.auto) {
+      if (currentStatus) currentStatus.calibrated = true;
+      calibrationHint("calOk");
+      return true;
+    }
+    calibrating = true;
+    calibrationHint("calNow");
+    say("calTaskNow");
+    return false;
+  } finally {
+    findingPointer = false;
+    updateTaskControls();
+  }
+}
+$("cal").addEventListener("click", () => { pendingTask = null; calibrate(); });
+$("type").addEventListener("click", async () => {
+  const result = await post("/api/type", { text: $("text").value });
+  if (result) $("text").value = "";
+  if (result?.input?.needs_confirmation) say("chooseChinese");
 });
-$("type").addEventListener("click", async () => { if (await post("/api/type", { text: $("text").value })) $("text").value = ""; });
 $("press").addEventListener("click", () => post("/api/key", { text: $("key").value }));
-function start(task) {
+function updateTaskControls() {
+  const s = currentStatus;
+  const disabled = starting || findingPointer || !s || s.agent.running || !s.device || !s.screen;
+  const hint = starting || findingPointer ? "preparingTask" : !s ? "serverOffline" : s.agent.running ? "taskRunning"
+    : !s.device ? "needDevice" : !s.screen ? "needScreen" : calibrating ? "calTaskNow"
+    : !s.calibrated ? "calBeforeStart" : null;
+  $("run").disabled = disabled;
+  $("run").title = hint ? t(hint) : "";
+  $("task-hint").textContent = hint ? t(hint) : "";
+  $("examples").querySelectorAll("button").forEach((b) => { b.disabled = disabled; });
+  $("cal").disabled = starting || findingPointer || Boolean(s?.agent.running);
+  $("stop").hidden = !(starting || s?.agent.running);
+}
+async function start(task) {
+  if (starting || findingPointer) return;
+  task = task.trim();
   if (!task) return say("needTask");
-  post("/api/agent", { text: task });
+  if (calibrating) return say("calTaskNow");
+  starting = true;
+  startCancelled = false;
+  updateTaskControls();
+  try {
+    const r = await fetch("/api/status");
+    if (!r.ok) throw new Error("status unavailable");
+    const s = currentStatus = await r.json();
+    if (startCancelled) return;
+    if (s.agent.running) return say("taskRunning");
+    if (!s.device) return say("needDevice");
+    if (!s.screen) return say("needScreen");
+    // A device/orientation change invalidates calibration, not the user's ability to submit a task.
+    if (!s.calibrated) {
+      if (!await calibrate()) {
+        if (calibrating && !startCancelled) pendingTask = task;  // resume after the pointer click
+        return;
+      }
+    }
+    if (startCancelled) return;
+    if (await post("/api/agent", { text: task }) && currentStatus) currentStatus.agent.running = true;
+  } catch {
+    say("serverOffline");
+  } finally {
+    starting = false;
+    updateTaskControls();
+  }
 }
 $("run").addEventListener("click", () => start($("task").value.trim()));
-$("stop").addEventListener("click", () => post("/api/agent/stop"));
+function stop() {
+  startCancelled = true;
+  pendingTask = null;
+  calibrating = false;
+  calibrationHint(null);
+  return post("/api/agent/stop");
+}
+$("stop").addEventListener("click", stop);
 $("clear").addEventListener("click", async () => {
   if (await post("/api/agent/clear")) { $("task").value = ""; say(null); }
 });
-$("estop").addEventListener("click", () => post("/api/agent/stop"));
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("zoom").open) post("/api/agent/stop"); });
+$("estop").addEventListener("click", stop);
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("zoom").open) stop(); });
 
 // ---- polling -------------------------------------------------------------------------
 
 let shown = "";
 async function poll() {
   try {
-    const s = await (await fetch("/api/status")).json();
+    const r = await fetch("/api/status");
+    if (!r.ok) throw new Error("status unavailable");
+    const s = currentStatus = await r.json();
     let ready = true;
     $("setup").querySelectorAll("li").forEach((li) => { const ok = s[li.dataset.key]; li.classList.toggle("done", ok); ready &&= ok; });
     $("setup").classList.toggle("all-done", ready);
 
     const a = s.agent, steps = a.steps;
-    $("run").disabled = a.running || !ready;
-    $("examples").querySelectorAll("button").forEach((b) => { b.disabled = a.running || !ready; });
-    $("stop").hidden = !a.running;
+    updateTaskControls();
     $("clear").hidden = a.running || !steps.length;
     $("live-dot").classList.toggle("on", a.running);
 
     aspect = s.aspect || aspect;
+    live.parentElement.style.aspectRatio = String(aspect);
+    live.parentElement.style.height = `min(calc(100vh - 165px), ${520 / aspect}px)`;
     const avg = (xs) => (xs.length ? fmt(xs.reduce((n, x) => n + x, 0) / xs.length) : "–");
     const planned = steps.filter((x) => isPlan(x) && x.think_s != null).map((x) => x.think_s);
     const acted = steps.filter((x) => !isPlan(x) && x.think_s != null).map((x) => x.think_s);
@@ -294,7 +393,10 @@ async function poll() {
       if (a.running && cards.length) cards.at(-1).classList.add("current");
       $("wall").replaceChildren(...cards.reverse());  // newest first
     }
-  } catch { /* server restarting */ }
+  } catch {
+    currentStatus = null;
+    updateTaskControls();
+  }
   setTimeout(poll, 500);
 }
 

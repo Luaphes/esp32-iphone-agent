@@ -2,8 +2,9 @@ import asyncio
 import json
 
 import httpx
+import pytest
 
-from hidagent.llm import LLM
+from hidagent.llm import LLM, LLMResponseError
 
 
 def fake_server(llm: LLM, wants: str) -> list[dict]:
@@ -51,3 +52,49 @@ def test_extra_body_and_image_are_sent():
     body = seen[0]
     assert body["reasoning_effort"] == "none"
     assert body["messages"][1]["content"][0]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def response_server(llm: LLM, response: dict):
+    llm._http = httpx.AsyncClient(
+        base_url="http://test/v1",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=response)),
+    )
+
+
+@pytest.mark.parametrize("content", ["DO: done 已安装", "DO: tap 628 48", "THINK: still working"])
+def test_truncated_reply_is_rejected_even_when_it_contains_a_valid_action(content):
+    llm = LLM("http://test/v1", "vision")
+    response_server(llm, {"choices": [{"finish_reason": "length", "message": {"content": content}}]})
+    with pytest.raises(LLMResponseError, match="truncated.*finish_reason=length.*discarded"):
+        asyncio.run(llm.chat("sys", "install"))
+
+
+@pytest.mark.parametrize(("response", "diagnostic"), [
+    ({"choices": []}, r"choices\[0\]"),
+    ({}, r"choices\[0\]"),
+    ({"choices": [None]}, r"choices\[0\]"),
+    ({"choices": [{}]}, r"missing choices\[0\].message"),
+    ({"choices": [{"message": {}}]}, "no usable text"),
+    ({"choices": [{"message": {"content": None}}]}, "no usable text"),
+    ({"choices": [{"message": {"content": "  "}}]}, "no usable text"),
+    ({"choices": [{"message": {"content": [{"type": "text", "text": "DO: done"}]}}]}, "no usable text"),
+])
+def test_unusable_response_has_a_clear_diagnostic(response, diagnostic):
+    llm = LLM("http://test/v1", "vision")
+    response_server(llm, response)
+    with pytest.raises(LLMResponseError, match=diagnostic):
+        asyncio.run(llm.chat("sys", "hi"))
+
+
+def test_complete_reply_preserves_content():
+    llm = LLM("http://test/v1", "vision")
+    response_server(llm, {"choices": [{"finish_reason": "stop", "message": {"content": "THINK: ready\nDO: wait"}}]})
+    assert asyncio.run(llm.chat("sys", "hi")) == "THINK: ready\nDO: wait"
+
+
+@pytest.mark.parametrize("reason", ["content_filter", "tool_calls", "function_call", "error"])
+def test_nonfinal_response_cannot_supply_actions(reason):
+    llm = LLM("http://test/v1", "vision")
+    response_server(llm, {"choices": [{"finish_reason": reason, "message": {"content": "DO: done"}}]})
+    with pytest.raises(LLMResponseError, match="unusable finish_reason"):
+        asyncio.run(llm.chat("sys", "hi"))
