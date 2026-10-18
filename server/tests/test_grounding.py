@@ -5,7 +5,7 @@ import pytest
 from PIL import Image
 
 from hidagent.debug import Trace
-from hidagent.grounding import locate_tap
+from hidagent.grounding import discover_tools, locate_tap
 
 
 class Locator:
@@ -35,7 +35,7 @@ def test_crop_point_maps_back_to_original_screen(reply):
     assert llm.image.size == (1000, 1000)
     assert "美团" in llm.prompt
     assert "blank note body" in llm.system
-    assert (result["x"], result["y"]) == (234, 743)
+    assert (result["x"], result["y"]) == (241, 743)
     assert result["proposed"] == {"x": 178, "y": 719}
     assert proposed["x"] == 178
 
@@ -43,10 +43,46 @@ def test_crop_point_maps_back_to_original_screen(reply):
 def test_toolbar_tap_searches_the_whole_toolbar_band():
     llm = Locator("POINT 250 500")
     result = asyncio.run(locate_tap(llm, frame(), {"action": "tap", "x": 620, "y": 50,
-                                                    "thought": "the drawing tool"}, Trace(None)))
+                                                    "top_toolbar": True, "thought": "the drawing tool"}, Trace(None)))
     # The full 752-pixel toolbar is the crop; 250/1000 of it is the left-side pen (screen x=0.25).
     assert (result["x"], result["y"]) == (250, 100)
     assert result["proposed"] == {"x": 620, "y": 50}
+
+
+def test_toolbar_crop_preserves_icon_shape_and_ignores_mixed_old_context():
+    from PIL import ImageDraw
+
+    im = Image.new("RGB", (752, 1080), "white")
+    ImageDraw.Draw(im).rectangle((100, 50, 140, 90), fill="red")
+    output = io.BytesIO()
+    im.save(output, "JPEG")
+    llm = Locator("POINT 250 500")
+    asyncio.run(locate_tap(llm, output.getvalue(), {"x": 620, "y": 50, "top_toolbar": True,
+                         "target": "current square icon", "thought": "old failed search field"}, Trace(None)))
+    red = [(x, y) for y in range(1000) for x in range(1000)
+           if (p := llm.image.getpixel((x, y)))[0] > 180 and p[1] < 80 and p[2] < 80]
+    xs, ys = zip(*red, strict=True)
+    assert abs((max(xs)-min(xs)) - (max(ys)-min(ys))) <= 2
+    assert 'old failed search field' not in llm.prompt and 'current square icon' in llm.prompt
+
+
+def test_padding_is_not_a_valid_target():
+    with pytest.raises(RuntimeError, match="padding"):
+        asyncio.run(locate_tap(Locator("POINT 250 100"), frame(),
+                              {"x": 620, "y": 50, "top_toolbar": True}, Trace(None)))
+
+
+def test_neutral_tool_inventory_rejects_padding_and_destructive_controls():
+    llm = Locator('''{"tools":[
+      {"x":300,"y":500,"appearance":"circle with tip","kind":"tool"},
+      {"x":500,"y":500,"appearance":"trash can","kind":"tool"},
+      {"x":700,"y":500,"appearance":"jar or container","kind":"tool"},
+      {"x":400,"y":500,"appearance":"small white dot","kind":"tool"},
+      {"x":600,"y":500,"appearance":"box with arrow","kind":"sharing"},
+      {"x":200,"y":100,"appearance":"square in padding","kind":"tool"}]}''')
+    result = asyncio.run(discover_tools(llm, frame(), Trace(None)))
+    assert len(result) == 1 and result[0]['x'] == 300
+    assert 'circle' in result[0]['appearance']
 
 
 @pytest.mark.parametrize("reply", ["NOT_FOUND", "POINT 1001 200", "POINT 0 200", "maybe POINT 200 300"])
